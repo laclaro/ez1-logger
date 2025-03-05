@@ -31,7 +31,7 @@ INVERTER_DEFAULT_CONFIG = {
 
 # Initialize logging
 logger = logging.getLogger()
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO)
 
 
 class EZ1Logger:
@@ -98,6 +98,7 @@ class EZ1Logger:
         if user and password:
             mqtt_client.username_pw_set(user, password)
         mqtt_client.connect(host, port, 60)
+        #mqtt_client.loop_start()
         return mqtt_client
 
     def data_log_init(self, header):
@@ -212,20 +213,25 @@ class EZ1Logger:
             await log_file.write(f"{row_str}\n")
             logger.debug(f"Logged data: {row_str}")
 
-    async def publish_to_mqtt(self, topic_name: str, payload_dict: dict):
+    async def publish_to_mqtt(self, topic_name: str, payload_dict: dict | list[dict]):
         """Publish given payload data dictionary via MQTT
 
         :param topic_name: the last part of the topic
         :param payload_dict: dictionary with data to publish
         """
-        if "timestamp_ms" not in payload_dict:
-            payload_dict["timestamp_ms"] = int(datetime.now().timestamp() * 1000)
-        topic = f"{self.mqtt_topic_base}/{topic_name}"
-        payload_json_str = json.dumps(payload_dict)
-        msg_info = self.mqtt_client.publish(topic, payload_json_str)
+        if self.mqtt_client.is_connected():
+            if isinstance(payload_dict, dict):
+                if "timestamp_ms" not in payload_dict:
+                    payload_dict["timestamp_ms"] = int(datetime.now().timestamp() * 1000)
+            topic = f"{self.mqtt_topic_base}/{topic_name}"
+            payload_json_str = json.dumps(payload_dict)
+            msg_info = self.mqtt_client.publish(topic, payload_json_str)
 
-        logger.info(f"Published data to MQTT at topic {topic}: {payload_json_str}")
-        return msg_info
+            logger.info(f"Published data to MQTT at topic {topic}: {payload_json_str}")
+            return msg_info
+        else:
+            logger.warning("Could not connect to MQjTT server!")
+            return None
 
     async def calc_publish_statistics(self):
         """Read log file data, calculate several things such as daily maxima and lifetime production
@@ -255,6 +261,7 @@ class EZ1Logger:
             if seconds_until_daylight == 0:
                 try:
                     self.mqtt_client.loop_start()
+                    await asyncio.sleep(3)
 
                     if not self.mqtt_client.is_connected():
                         logger.warning("Could not connect to MQTT server!")
@@ -274,10 +281,10 @@ class EZ1Logger:
 
                     self.mqtt_client.loop_stop()
 
-                except TimeoutError as e:
+                except KeyError as e:
                     # exception: inverter is unresponsive
                     logger.debug(f"{type(e).__name__}: {e}. Inverter not reachable.")
-                    await self.mqtt_set_inverter_online_state(state=0)
+                    await self.mqtt_set_inverter_online_state(state=False)
 
                     if -1 < inverter_unresponsive_seconds <= self.assume_inverter_offline_after_seconds:
                         inverter_unresponsive_seconds += self.poll_period
@@ -287,16 +294,22 @@ class EZ1Logger:
                         inverter_unresponsive_seconds = -1
                 else:
                     # no exception: inverter online. publish online state of inverter
-                    await self.mqtt_set_inverter_online_state(state=1)
+                    await self.mqtt_set_inverter_online_state(state=True)
                     inverter_unresponsive_seconds = 0
 
                 finally:
+                    self.mqtt_client.loop_stop()
                     await asyncio.sleep(self.poll_period)
+                    self.mqtt_client.loop_start()
+                    await asyncio.sleep(5)
 
             else:
+                self.mqtt_client.loop_stop()
                 await asyncio.sleep(seconds_until_daylight)
+                self.mqtt_client.loop_start()
+                await asyncio.sleep(5)
 
-    async def mqtt_set_inverter_online_state(self, state=0):
+    async def mqtt_set_inverter_online_state(self, state=True):
         timestamp_ms = int(datetime.now().timestamp() * 1000)
         await self.publish_to_mqtt("online", {"timestamp": timestamp_ms, "value": state})
 
@@ -308,7 +321,7 @@ class EZ1Logger:
 if __name__ == "__main__":
 
     # test only, do not actually read from inverter
-    test_mode = True
+    test_mode = False
 
     log_file = "/var/log/apsystems-ez1/ez1.csv"
     poll_period_seconds = 300
