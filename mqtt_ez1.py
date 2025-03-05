@@ -13,279 +13,320 @@ import paho.mqtt.client as mqtt
 from APsystemsEZ1 import APsystemsEZ1M
 
 # test only, do not actually read from inverter
-TEST = False
+test_mode = False
 
-# time in seconds (min: 60)
-POLL_PERIOD_SECONDS = 300
+log_file = "/var/log/apsystems-ez1/ez1.csv"
+poll_period_seconds = 300
+mqtt_topic_base = "solar/ez1"
+coordinates = (51.31667, 9.5)
+assume_offline_after_seconds = 600
 
-# log file
-LOG_FILE = '/var/log/apsystems-ez1/ez1.csv'
+MQTT_DEFAULT_CONFIG = {
+    "host": "localhost",
+    "ca_certs": None,
+    "port": 1883,
+    "user": None,
+    "password": None,
+    "client_id": f'ez1-get-data-mqtt-{randint(0, 1000)}'
+    }
 
-# MQTT Configuration
-MQTT_IP = "192.168.1.100"  # Replace with your broker's address
-CA_CERT = "/etc/mosquitto/certs/ca.crt"
-MQTT_PORT = 8883  # Broker port (default for unencrypted MQTT)
-MQTT_USER = "mqtt_client"
-MQTT_PASSWORD = "secret"
-MQTT_CLIENT_ID = f'ez1-get-data-mqtt-{randint(0, 1000)}'
-MQTT_TOPIC_BASE = "solar/ez1"
-
-# Initialize the inverter with the specified IP address and port number.
-INVERTER_IP = "192.168.1.25"
-INVERTER_PORT = 8050
-ASSUME_INVERTER_OFFLINE_AFTER_SECONDS = 600
-
-COORDINATES = (51.31667, 9.5)
-
-if TEST:
-    pass
-LOG_FILE = 'ez1.csv'
-CA_CERT = "ca.crt"
+INVERTER_DEFAULT_CONFIG = {
+    "ip_address": "192.168.1.25",
+    "port": 8050,
+    "timeout": 15,
+    "max_power": 800,
+    "min_power": 30
+}
 
 # Initialize logging
 logger = logging.getLogger()
 logging.basicConfig(level=logging.DEBUG)
 
 
-def get_seconds_until_daylight(coordinates: tuple = (52.52, 13.4050)):
-    """"""
-    # Get current local time (system time, which is already in Berlin time)
-    now_local = datetime.now()
+class EZ1Logger:
+    def __init__(self, mqtt_config, inverter_config, log_file, poll_period, coordinates, mqtt_topic_base="solar/ez1",
+                 assume_inverter_offline_after_seconds=300, test_mode=False):
+        self.test_mode = test_mode
 
-    lat = coordinates[0]
-    lon = coordinates[1]
+        logger.info("Initializing EZ1Logger.")
+        logger.info(f"Logging to file: {log_file}")
+        logger.info(f"Poll period time: {poll_period} s")
 
-    # Create a Sun object for Berlin (coordinates 52.52, 13.4050)
-    sun = Sun(lat, lon)
+        # create log file if it does not exist
+        csv_header = "date;timestamp_ms;power_1;power_2;daily_production_1;daily_production_2"
+        self.log_file = Path(log_file)
+        if not self.log_file.exists():
+            self.data_log_init(csv_header)
 
-    # Get today's sunrise time in local time (Berlin time)
-    today_midnight = datetime.combine(now_local.date(), datetime.min.time())
-    sunrise_naive = sun.get_sunrise_time(today_midnight)
-    sunset_naive = sun.get_sunset_time(today_midnight)
+        self.poll_period = poll_period
 
-    # Make sure sunrise and sunset times are timezone-aware (convert to Berlin time)
-    sunrise = sunrise_naive.replace(tzinfo=now_local.tzinfo)
-    sunset = sunset_naive.replace(tzinfo=now_local.tzinfo)
+        self.mqtt_config = MQTT_DEFAULT_CONFIG.update(mqtt_config)
+        self.inverter_config = INVERTER_DEFAULT_CONFIG.update(inverter_config)
 
-    # If it's already after sunset today, get the next day's sunrise time
-    if now_local > sunset:
-        # Get the next day's sunrise time
-        next_day = datetime.combine(now_local.date() + timedelta(days=1), datetime.min.time())
-        sunrise_naive = sun.get_sunrise_time(next_day)
+        self.assume_inverter_offline_after_seconds = assume_inverter_offline_after_seconds
+        self.coordinates = coordinates
+
+        self.inverter = APsystemsEZ1M(**self.inverter_config)
+
+        self.mqtt_client = self.get_mqtt_client(**self.mqtt_config)
+        self.mqtt_topic_base = mqtt_topic_base
+
+    @staticmethod
+    def get_mqtt_client(client_id: str, host: str, port: str, user: str = None,
+                        password: str = None, ca_certs: str = None, insecure: bool = True):
+        """Initialize and return MQTT Client object.
+
+        :param client_id: client id
+        :param host: hostname or IP address
+        :param port: the port of the MQTT server
+        :param user: username, defaults to None
+        :param password: user password, defaults to None
+        :param ca_certs: CA certificate file path, defaults to None
+        :param insecure: If TLS is used: verify certificates, defaults to True
+        """
+        def on_connect(client, userdata, flags, rc):
+            if rc == 0:
+                logger.info("Connected to MQTT Broker!")
+            else:
+                logger.warning(f"Failed to connect with result code {rc}")
+
+        def on_disconnect(client, userdata, rc):
+            if rc != 0:
+                logger.warning("Unexpected MQTT disconnection. Will auto-reconnect")
+
+        mqtt_client = mqtt.Client(client_id=client_id)
+        mqtt_client.on_connect = on_connect
+        mqtt_client.on_disconnect = on_disconnect
+        if ca_certs:
+            mqtt_client.tls_set(ca_certs=ca_certs)
+            if insecure:
+                mqtt_client.tls_insecure_set(True)
+        if user and password:
+            mqtt_client.username_pw_set(user, password)
+        mqtt_client.connect(host, port, 60)
+        mqtt_client.loop_start()  # Start the loop for MQTT client to handle messaging
+        return mqtt_client
+
+    def data_log_init(self, header):
+        # create folder and file for logging
+        self.log_file.parent.mkdir(exist_ok=True)
+        if not self.log_file.exists():
+            logger.info(f"Creating file {self.log_file}")
+            with open(self.log_file, mode='w') as log_file:
+                log_file.write(f"{header}\n")
+
+    @staticmethod
+    def get_seconds_until_daylight(coordinates):
+        # Get current local time (system time, which is already in Berlin time)
+        now_local = datetime.now()
+
+        lat = coordinates[0]
+        lon = coordinates[1]
+
+        # Create a Sun object for Berlin (coordinates 52.52, 13.4050)
+        sun = Sun(lat, lon)
+
+        # Get today's sunrise time in local time (Berlin time)
+        today_midnight = datetime.combine(now_local.date(), datetime.min.time())
+        sunrise_naive = sun.get_sunrise_time(today_midnight)
+        sunset_naive = sun.get_sunset_time(today_midnight)
+
+        # Make sure sunrise and sunset times are timezone-aware (convert to Berlin time)
         sunrise = sunrise_naive.replace(tzinfo=now_local.tzinfo)
+        sunset = sunset_naive.replace(tzinfo=now_local.tzinfo)
 
-    # If it's daylight (between sunrise and sunset), return 0 seconds
-    if sunrise <= now_local <= sunset:
-        return 0  # It's daylight, no need to wait for daylight
+        # If it's already after sunset today, get the next day's sunrise time
+        if now_local > sunset:
+            # Get the next day's sunrise time
+            next_day = datetime.combine(now_local.date() + timedelta(days=1), datetime.min.time())
+            sunrise_naive = sun.get_sunrise_time(next_day)
+            sunrise = sunrise_naive.replace(tzinfo=now_local.tzinfo)
 
-    # Otherwise, calculate time difference in seconds until the next sunrise
-    time_diff = sunrise - now_local
-    return time_diff.total_seconds()
+        # If it's daylight (between sunrise and sunset), return 0 seconds
+        if sunrise <= now_local <= sunset:
+            return 0  # It's daylight, no need to wait for daylight
 
+        # Otherwise, calculate time difference in seconds until the next sunrise
+        time_diff = sunrise - now_local
+        return time_diff.total_seconds()
 
-def get_lifetime_production(df):
-    series_sum = df[["daily_production_1", "daily_production_2"]]\
-        .rename(columns={'daily_production_1': 'lifetime_production_1',
-                         'daily_production_2': 'lifetime_production_2'}).sum()
-    return series_sum.map('{:,.2f}'.format)
+    @staticmethod
+    def calc_lifetime_production(df):
+        series_sum = df[["daily_production_1", "daily_production_2"]]\
+            .rename(columns={'daily_production_1': 'lifetime_production_1',
+                             'daily_production_2': 'lifetime_production_2'}).sum()
+        return series_sum.map('{:,.2f}'.format)
 
+    @staticmethod
+    def calc_daily_max(df: pd.DataFrame) -> pd.DataFrame:
+        """Group entries by date and calculate the maximal values for every day.
 
-def get_daily_max(df):
+        :param df: input pandas DataFrame
+        """
+        # Convert 'date' column to datetime format
+        df['date'] = pd.to_datetime(df['date'])
 
-    # Convert 'date' column to datetime format
-    df['date'] = pd.to_datetime(df['date'])
+        # Extract date only (without time) to group by day
+        df['date_only'] = df['date'].dt.date
 
-    # Extract date only (without time) to group by day
-    df['date_only'] = df['date'].dt.date
+        # Group by the date (ignoring time) and calculate the max values for each column
+        df_max = df.groupby('date_only').agg({
+            'power_1': 'max',
+            'power_2': 'max',
+            'daily_production_1': 'max',
+            'daily_production_2': 'max'
+        }).reset_index()
 
-    # Group by the date (ignoring time) and calculate the max values for each column
-    df_max = df.groupby('date_only').agg({
-        'power_1': 'max',
-        'power_2': 'max',
-        'daily_production_1': 'max',
-        'daily_production_2': 'max'
-    }).reset_index()
+        # add timestamp
+        df_max['timestamp_ms'] = pd.to_datetime(df_max['date_only']).astype(int) / 10**6
+        del df_max["date_only"]
 
-    # add timestamp
-    df_max['timestamp_ms'] = pd.to_datetime(df_max['date_only']).astype(int) / 10**6
-    del df_max["date_only"]
+        return df_max
 
-    return df_max
+    async def get_data_from_inverter(self) -> dict:
+        """Query data from EZ1 inverter and return the data as dictionary.
+        If self.test_mode is set, return random data.
+        """
+        now = datetime.now()
+        if not self.test_mode:
+            response = await self.inverter.get_output_data()
+            return {
+                "date": now.strftime("%Y-%m-%d %H:%M:%S"),
+                "power_1": response.p1,
+                "power_2": response.p2,
+                "daily_production_1": response.e1,
+                "daily_production_2": response.e2
+            }
+        else:
+            num = random()
+            return {
+                "date": now.strftime("%Y-%m-%d %H:%M:%S"),
+                "power_1": num,
+                "power_2": -num,
+                "daily_production_1": num + 1,
+                "daily_production_2": num - 1
+            }
 
+    async def log_to_file(self, data_row: dict):
+        """Write row to data log."""
+        # add timestamp if not present
+        if "timestamp_ms" not in data_row:
+            data_row["timestamp_ms"] = int(datetime.now().timestamp() * 1000)
 
-async def get_data_from_inverter(inverter, test=TEST):
-    now = datetime.now()
-    if not test:
-        response = await inverter.get_output_data()
-        return {
-            "date": now.strftime("%Y-%m-%d %H:%M:%S"),
-            "power_1": response.p1,
-            "power_2": response.p2,
-            "daily_production_1": response.e1,
-            "daily_production_2": response.e2
-        }
-    else:
-        num = random()
-        return {
-            "date": now.strftime("%Y-%m-%d %H:%M:%S"),
-            "power_1": num,
-            "power_2": -num,
-            "daily_production_1": num+1,
-            "daily_production_2": num-1
-        }
+        # Writing to a CSV file asynchronously with aiofiles
+        async with aiofiles.open(self.log_file, mode="a") as log_file:
+            row_str = ";".join(map(str, data_row.values()))  # Join values with ';'
+            await log_file.write(f"{row_str}\n")
+            logger.debug(f"Logged data: {row_str}")
 
+    async def publish_to_mqtt(self, topic_name: str, payload_dict: dict):
+        """Publish given payload data dictionary via MQTT
 
-async def log_to_file(row_list: dict):
-    # add timestamp if not present
-    if "timestamp_ms" not in row_list:
-        row_list["timestamp_ms"] = int(datetime.now().timestamp() * 1000)
+        :param topic_name: the last part of the topic
+        :param payload_dict: dictionary with data to publish
+        """
+        if "timestamp_ms" not in payload_dict:
+            payload_dict["timestamp_ms"] = int(datetime.now().timestamp() * 1000)
+        topic = f"{self.mqtt_topic_base}/{topic_name}"
+        payload_json_str = json.dumps(payload_dict)
+        self.mqtt_client.publish(topic, payload_json_str)
+        logger.info(f"Published data to MQTT at topic {topic}: {payload_json_str}")
 
-    # Writing to a CSV file asynchronously with aiofiles
-    async with aiofiles.open(LOG_FILE, mode="a") as log_file:
-        row_str = ";".join(map(str, row_list.values()))  # Join values with ';'
-        await log_file.write(f"{row_str}\n")
-        logger.debug(f"Logged data: {row_str}")
+    async def calc_publish_statistics(self):
+        """Read log file data, calculate several things such as daily maxima and lifetime production
+        and publish statistical data via MQTT."""
+        # read log file
+        df = pd.read_csv(self.log_file, sep=";")
 
+        # get daily max values as dict
+        df_max = self.calc_daily_max(df)
 
-async def publish_to_mqtt(mqtt_client: mqtt.Client, topic: str, payload_dict: dict):
-    if "timestamp_ms" not in payload_dict:
-        payload_dict["timestamp_ms"] = int(datetime.now().timestamp() * 1000)
-    payload_json_str = json.dumps(payload_dict)
-    mqtt_client.publish(topic, payload_json_str)
-    logger.info(f"Published data to MQTT at topic {topic}: {payload_json_str}")
+        # Publish daily maximal values via MQTT as JSON
+        payload_dict = df_max.to_dict(orient="records")
+        await self.publish_to_mqtt("max", payload_dict)
 
+        # Publish total lifetime production in kWh via MQTT as JSON
+        series_lifetime_production = self.calc_lifetime_production(df_max)
+        payload_dict = series_lifetime_production.to_dict()
+        await self.publish_to_mqtt("lifetime_production", payload_dict)
 
-async def calc_publish_statistics(mqtt_client: mqtt.Client, log_file: str | Path,
-                                  topic_base: str):
-    # read log file
-    df = pd.read_csv(log_file, sep=";")
+    async def main_loop_get_publish_data_during_daylight(self):
+        """Main loop querying the EZ1 inverter publishing the data, logging to file,
+        calculating statistical values from the log file and publish those as well.
+        """
+        inverter_unresponsive_seconds = 0
+        while True:
+            seconds_until_daylight = self.get_seconds_until_daylight(self.coordinates)
+            if seconds_until_daylight == 0:
+                try:
+                    # get data from the inverter
+                    payload_dict = await self.get_data_from_inverter()
 
-    # get daily max values as dict
-    df_max = get_daily_max(df)
+                    # Log data to cv file
+                    await self.log_to_file(payload_dict)
 
-    # Publish daily maximal values via MQTT as JSON
-    payload_dict = df_max.to_dict(orient="records")
-    await publish_to_mqtt(mqtt_client, f"{topic_base}/max", payload_dict)
+                    # Publish the same data to MQTT as JSON
+                    await self.publish_to_mqtt("data", payload_dict)
 
-    # Publish total lifetime production in kWh via MQTT as JSON
-    series_lifetime_production = get_lifetime_production(df_max)
-    payload_dict = series_lifetime_production.to_dict()
-    await publish_to_mqtt(mqtt_client, f"{topic_base}/lifetime_production", payload_dict)
+                    # calculate statistics from log file and publish data
+                    await self.calc_publish_statistics()
 
+                except Exception as e:
+                    # exception: inverter is unresponsive
+                    logger.debug(f"Error: {e}. Inverter not reachable.")
+                    await self.mqtt_set_inverter_online_state(state=0)
 
-async def get_publish_data_during_daylight(mqtt_client: mqtt.Client, inverter: APsystemsEZ1M,
-                                           topic_base: str, log_file: str | Path,
-                                           coordinates: tuple):
-    """Main loop querying the EZ1 inverter publishing the data, logging to file,
-    calculating statistical values from the log file and publish those as well.
+                    if -1 < inverter_unresponsive_seconds <= self.assume_inverter_offline_after_seconds:
+                        inverter_unresponsive_seconds += self.poll_period
+                    else:
+                        await self.log_to_file({"power_1": 0, "power_2": 0})
+                        await self.publish_to_mqtt("data", {"power_1": 0, "power_2": 0})
+                        inverter_unresponsive_seconds = -1             
 
-    :param mqtt_client: paho mqtt client object
-    :param inverter: ez1 inverter object
-    :param topic_base: mqtt topic base path
-    :param log_file: log file
-    :param coordinates: coordinates tuple
-    """
-    inverter_unresponsive_seconds = 0
-    while True:
-        seconds_until_daylight = get_seconds_until_daylight(coordinates)
-        if seconds_until_daylight == 0:
-            try:
-                # get data from the inverter
-                payload_dict = await get_data_from_inverter(inverter)
-
-                # Log data to cv file
-                await log_to_file(payload_dict)
-
-                # Publish the same data to MQTT as JSON
-                await publish_to_mqtt(mqtt_client, f"{topic_base}/data", payload_dict)
-
-                # calculate statistics from log file and publish data
-                await calc_publish_statistics(mqtt_client, log_file, topic_base=topic_base)
-
-            except Exception as e:
-                # exception: inverter is unresponsive
-                logger.debug(f"Error: {e}. Inverter not reachable.")
-                await mqtt_set_inverter_online_state(mqtt_client, topic_base, state=0)
-
-                if -1 < inverter_unresponsive_seconds <= ASSUME_INVERTER_OFFLINE_AFTER_SECONDS:
-                    inverter_unresponsive_seconds += POLL_PERIOD_SECONDS
                 else:
-                    await log_to_file({"power_1": 0, "power_2": 0})
-                    await publish_to_mqtt(mqtt_client, f"{topic_base}/data", {"power_1": 0, "power_2": 0})
-                    inverter_unresponsive_seconds = -1             
+                    # no exception: inverter online. publish online state of inverter
+                    await self.mqtt_set_inverter_online_state(state=1)
+                    inverter_unresponsive_seconds = 0
+
+                finally:
+                    await asyncio.sleep(self.poll_period)
 
             else:
-                # no exception: inverter online. publish online state of inverter
-                await mqtt_set_inverter_online_state(mqtt_client, topic_base, state=1)
-                inverter_unresponsive_seconds = 0
+                await asyncio.sleep(seconds_until_daylight)
 
-            finally:
-                await asyncio.sleep(POLL_PERIOD_SECONDS)
+    async def mqtt_set_inverter_online_state(self, state=0):
+        timestamp_ms = int(datetime.now().timestamp() * 1000)
+        await self.publish_to_mqtt("online", {"timestamp": timestamp_ms, "value": state})
 
-        else:
-            await asyncio.sleep(seconds_until_daylight)
-
-
-async def mqtt_set_inverter_online_state(mqtt_client, topic_base, state=0):
-    timestamp_ms = int(datetime.now().timestamp() * 1000)
-    await publish_to_mqtt(mqtt_client, f"{topic_base}/online",
-                          {"timestamp": timestamp_ms, "value": state})
-
-
-def initialize_mqtt_client(client_id=MQTT_CLIENT_ID, host=MQTT_IP, port=MQTT_PORT,
-                           ca_certs=CA_CERT, user=None, password=None):
-
-    def on_connect(client, userdata, flags, rc):
-        if rc == 0:
-            logger.info("Connected to MQTT Broker!")
-        else:
-            logger.warning(f"Failed to connect with result code {rc}")
-
-    def on_disconnect(client, userdata, rc):
-        if rc != 0:
-            logger.warning("Unexpected MQTT disconnection. Will auto-reconnect")
-
-    mqtt_client = mqtt.Client(client_id=client_id)
-    mqtt_client.on_connect = on_connect
-    mqtt_client.on_disconnect = on_disconnect
-    if ca_certs:
-        mqtt_client.tls_set(ca_certs=ca_certs)
-        mqtt_client.tls_insecure_set(True)
-    if user and password:
-        mqtt_client.username_pw_set(user, password)
-    mqtt_client.connect(host, port, 60)
-    mqtt_client.loop_start()  # Start the loop for MQTT client to handle messaging
-    return mqtt_client
-
-
-def initialize_log_file(log_file, header):
-    # create folder and file for logging
-    if not Path(LOG_FILE).parent.exists():
-        Path(LOG_FILE).parent.mkdir(exist_ok=True)
-    if not Path(LOG_FILE).exists():
-        logger.info(f"Creating file {LOG_FILE}")
-        with open(LOG_FILE, mode='w') as log_file:
-            log_file.write(f"{header}\n")
+    def run(self):
+        """Run main loop."""
+        asyncio.run(self.main_loop_get_publish_data_during_daylight())
 
 
 if __name__ == "__main__":
 
-    logger.info(f"Logging to file: {LOG_FILE}")
-    logger.info(f"Poll period time: {POLL_PERIOD_SECONDS} s")
+    # this could be read from config files
+    mqtt_config = {
+        "ip": "192.168.1.100",
+        "ca_certs": "/etc/mosquitto/certs/ca.crt",
+        "port": 8883,
+        "user": "mqtt_client",
+        "password": "secret",
+        "client_id": f'ez1-get-data-mqtt-{randint(0, 1000)}',
+    }
 
-    csv_header = "date;timestamp_ms;power_1;power_2;"\
-        "daily_production_1;daily_production_2"
-    initialize_log_file(log_file=LOG_FILE, header=csv_header)
+    inverter_config = {
+        "ip_address": "192.168.1.25",
+        "port": 8050,
+        "timeout": 20,
+        "max_power": 800,
+        "min_power": 30
+    }
 
-    # initialize inverter object
-    ez1_inverter = APsystemsEZ1M(INVERTER_IP, INVERTER_PORT)
-
-    # initialize mqtt client
-    mqtt_client = initialize_mqtt_client(client_id=MQTT_CLIENT_ID, ca_certs=CA_CERT,
-                                         host=MQTT_IP, port=MQTT_PORT,
-                                         user=MQTT_USER, password=MQTT_PASSWORD)
-
-    # start the event loop
-    asyncio.run(get_publish_data_during_daylight(mqtt_client=mqtt_client, inverter=ez1_inverter,
-                                                 topic_base=MQTT_TOPIC_BASE, log_file=LOG_FILE,
-                                                 coordinates=COORDINATES))
+    ez1_logger = EZ1Logger(mqtt_config, inverter_config,
+                           log_file=log_file,
+                           coordinates=coordinates,
+                           mqtt_topic_base=mqtt_topic_base,
+                           poll_period=poll_period_seconds,
+                           assume_offline_after_seconds=assume_offline_after_seconds)
+    ez1_logger.run()
