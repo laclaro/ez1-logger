@@ -12,15 +12,6 @@ from suntime import Sun
 import paho.mqtt.client as mqtt
 from APsystemsEZ1 import APsystemsEZ1M
 
-# test only, do not actually read from inverter
-test_mode = False
-
-log_file = "/var/log/apsystems-ez1/ez1.csv"
-poll_period_seconds = 300
-mqtt_topic_base = "solar/ez1"
-coordinates = (51.31667, 9.5)
-assume_offline_after_seconds = 600
-
 MQTT_DEFAULT_CONFIG = {
     "host": "localhost",
     "ca_certs": None,
@@ -60,8 +51,11 @@ class EZ1Logger:
 
         self.poll_period = poll_period
 
-        self.mqtt_config = MQTT_DEFAULT_CONFIG.update(mqtt_config)
-        self.inverter_config = INVERTER_DEFAULT_CONFIG.update(inverter_config)
+        self.mqtt_config = MQTT_DEFAULT_CONFIG.copy()
+        self.mqtt_config.update(mqtt_config)
+
+        self.inverter_config = INVERTER_DEFAULT_CONFIG.copy()
+        self.inverter_config.update(inverter_config)
 
         self.assume_inverter_offline_after_seconds = assume_inverter_offline_after_seconds
         self.coordinates = coordinates
@@ -92,7 +86,7 @@ class EZ1Logger:
 
         def on_disconnect(client, userdata, rc):
             if rc != 0:
-                logger.warning("Unexpected MQTT disconnection. Will auto-reconnect")
+                logger.debug(f"Unexpected disconnection from MQTT server at {client.host}. Reconnecting.")
 
         mqtt_client = mqtt.Client(client_id=client_id)
         mqtt_client.on_connect = on_connect
@@ -104,7 +98,6 @@ class EZ1Logger:
         if user and password:
             mqtt_client.username_pw_set(user, password)
         mqtt_client.connect(host, port, 60)
-        mqtt_client.loop_start()  # Start the loop for MQTT client to handle messaging
         return mqtt_client
 
     def data_log_init(self, header):
@@ -229,8 +222,10 @@ class EZ1Logger:
             payload_dict["timestamp_ms"] = int(datetime.now().timestamp() * 1000)
         topic = f"{self.mqtt_topic_base}/{topic_name}"
         payload_json_str = json.dumps(payload_dict)
-        self.mqtt_client.publish(topic, payload_json_str)
+        msg_info = self.mqtt_client.publish(topic, payload_json_str)
+
         logger.info(f"Published data to MQTT at topic {topic}: {payload_json_str}")
+        return msg_info
 
     async def calc_publish_statistics(self):
         """Read log file data, calculate several things such as daily maxima and lifetime production
@@ -259,21 +254,29 @@ class EZ1Logger:
             seconds_until_daylight = self.get_seconds_until_daylight(self.coordinates)
             if seconds_until_daylight == 0:
                 try:
-                    # get data from the inverter
-                    payload_dict = await self.get_data_from_inverter()
+                    self.mqtt_client.loop_start()
 
-                    # Log data to cv file
-                    await self.log_to_file(payload_dict)
+                    if not self.mqtt_client.is_connected():
+                        logger.warning("Could not connect to MQTT server!")
+                    else:
 
-                    # Publish the same data to MQTT as JSON
-                    await self.publish_to_mqtt("data", payload_dict)
+                        # get data from the inverter
+                        payload_dict = await self.get_data_from_inverter()
 
-                    # calculate statistics from log file and publish data
-                    await self.calc_publish_statistics()
+                        # Log data to cv file
+                        await self.log_to_file(payload_dict)
 
-                except Exception as e:
+                        # Publish the same data to MQTT as JSON
+                        await self.publish_to_mqtt("data", payload_dict)
+
+                        # calculate statistics from log file and publish data
+                        await self.calc_publish_statistics()
+
+                    self.mqtt_client.loop_stop()
+
+                except TimeoutError as e:
                     # exception: inverter is unresponsive
-                    logger.debug(f"Error: {e}. Inverter not reachable.")
+                    logger.debug(f"{type(e).__name__}: {e}. Inverter not reachable.")
                     await self.mqtt_set_inverter_online_state(state=0)
 
                     if -1 < inverter_unresponsive_seconds <= self.assume_inverter_offline_after_seconds:
@@ -281,8 +284,7 @@ class EZ1Logger:
                     else:
                         await self.log_to_file({"power_1": 0, "power_2": 0})
                         await self.publish_to_mqtt("data", {"power_1": 0, "power_2": 0})
-                        inverter_unresponsive_seconds = -1             
-
+                        inverter_unresponsive_seconds = -1
                 else:
                     # no exception: inverter online. publish online state of inverter
                     await self.mqtt_set_inverter_online_state(state=1)
@@ -305,9 +307,18 @@ class EZ1Logger:
 
 if __name__ == "__main__":
 
+    # test only, do not actually read from inverter
+    test_mode = True
+
+    log_file = "/var/log/apsystems-ez1/ez1.csv"
+    poll_period_seconds = 300
+    mqtt_topic_base = "solar/ez1"
+    coordinates = (51.31667, 9.5)
+    assume_inverter_offline_after_seconds = 600
+
     # this could be read from config files
     mqtt_config = {
-        "ip": "192.168.1.100",
+        "host": "192.168.1.100",
         "ca_certs": "/etc/mosquitto/certs/ca.crt",
         "port": 8883,
         "user": "mqtt_client",
@@ -323,10 +334,14 @@ if __name__ == "__main__":
         "min_power": 30
     }
 
+    if test_mode:
+        log_file = './ez1.csv'
+        mqtt_config["ca_certs"] = None
+
     ez1_logger = EZ1Logger(mqtt_config, inverter_config,
                            log_file=log_file,
                            coordinates=coordinates,
                            mqtt_topic_base=mqtt_topic_base,
                            poll_period=poll_period_seconds,
-                           assume_offline_after_seconds=assume_offline_after_seconds)
+                           assume_inverter_offline_after_seconds=assume_inverter_offline_after_seconds)
     ez1_logger.run()
