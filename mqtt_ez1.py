@@ -40,8 +40,10 @@ logging.basicConfig(level=logging.INFO)
 
 
 class EZ1Logger:
-    def __init__(self, mqtt_config, inverter_config, log_file, poll_period, coordinates, mqtt_topic_base="solar/ez1",
-                 assume_inverter_offline_after_seconds=300, test_mode=False, log_columns_list=()):
+    def __init__(self, mqtt_config: dict[str], inverter_config: dict[str], mqtt_topic_base="solar/ez1",
+                 log_file="ez1.csv", log_columns_list=DEFAULT_COLUMNS_LIST,
+                 coordinates=(52.520, 13.405), poll_period=600, assume_inverter_offline_after_seconds=300,
+                 test_mode=False):
         self.test_mode = test_mode
 
         logger.info("Initializing EZ1Logger.")
@@ -102,8 +104,7 @@ class EZ1Logger:
                 mqtt_client.tls_insecure_set(True)
         if user and password:
             mqtt_client.username_pw_set(user, password)
-        mqtt_client.connect(host, port, 60)
-        #mqtt_client.loop_start()
+        mqtt_client.connect(host=host, port=port, keepalive=60)
         return mqtt_client
 
     def data_log_init(self):
@@ -116,21 +117,21 @@ class EZ1Logger:
 
     @staticmethod
     def get_seconds_until_daylight(coordinates):
-        # Get current local time (system time, which is already in Berlin time)
+        # Get current local time
         now_local = datetime.now()
 
         lat = coordinates[0]
         lon = coordinates[1]
 
-        # Create a Sun object for Berlin (coordinates 52.52, 13.4050)
+        # Create a Sun object for coordinates
         sun = Sun(lat, lon)
 
-        # Get today's sunrise time in local time (Berlin time)
+        # Get today's sunrise time in local time
         today_midnight = datetime.combine(now_local.date(), datetime.min.time())
         sunrise_naive = sun.get_sunrise_time(today_midnight)
         sunset_naive = sun.get_sunset_time(today_midnight)
 
-        # Make sure sunrise and sunset times are timezone-aware (convert to Berlin time)
+        # Make sure sunrise and sunset times are timezone-aware
         sunrise = sunrise_naive.replace(tzinfo=now_local.tzinfo)
         sunset = sunset_naive.replace(tzinfo=now_local.tzinfo)
 
@@ -147,7 +148,7 @@ class EZ1Logger:
 
         # Otherwise, calculate time difference in seconds until the next sunrise
         time_diff = sunrise - now_local
-        return time_diff.total_seconds()
+        return time_diff.total_seconds(), sunrise
 
     @staticmethod
     def calc_lifetime_production(df):
@@ -213,7 +214,7 @@ class EZ1Logger:
             data_row["timestamp_ms"] = int(datetime.now().timestamp() * 1000)
 
         # assume that data_row has identical keys to log_columns_list
-        data_row = {key: data_row[key] for key in self.log_columns_list}
+        data_row = {key: data_row[key] for key in self.log_columns_list if key in data_row}
 
         # Writing to a CSV file asynchronously with aiofiles
         async with aiofiles.open(self.log_file, mode="a") as log_file:
@@ -235,10 +236,10 @@ class EZ1Logger:
             payload_json_str = json.dumps(payload_dict)
             msg_info = self.mqtt_client.publish(topic, payload_json_str)
 
-            logger.info(f"Published data to MQTT at topic {topic}: {payload_json_str}")
+            logger.debug(f"Published data to MQTT at topic {topic}: {payload_json_str}")
             return msg_info
         else:
-            logger.warning("Could not connect to MQjTT server!")
+            logger.warning("Could not connect to MQTT server!")
             return None
 
     async def calc_publish_statistics(self):
@@ -263,59 +264,57 @@ class EZ1Logger:
         """Main loop querying the EZ1 inverter publishing the data, logging to file,
         calculating statistical values from the log file and publish those as well.
         """
-        inverter_unresponsive_seconds = 0
+        inverter_last_seen = 0
         while True:
-            seconds_until_daylight = self.get_seconds_until_daylight(self.coordinates)
-            if seconds_until_daylight == 0:
-                try:
-                    self.mqtt_client.loop_start()
-                    await asyncio.sleep(3)
+            try:
+                self.mqtt_client.loop_start()
+                await asyncio.sleep(3)
 
-                    if not self.mqtt_client.is_connected():
-                        logger.warning("Could not connect to MQTT server!")
-                    else:
-
-                        # get data from the inverter
-                        payload_dict = await self.get_data_from_inverter()
-
-                        # Log data to cv file
-                        await self.log_to_file(payload_dict)
-
-                        # Publish the same data to MQTT as JSON
-                        await self.publish_to_mqtt("data", payload_dict)
-
-                        # calculate statistics from log file and publish data
-                        await self.calc_publish_statistics()
-
-                    self.mqtt_client.loop_stop()
-
-                except KeyError as e:
-                    # exception: inverter is unresponsive
-                    logger.debug(f"{type(e).__name__}: {e}. Inverter not reachable.")
-                    await self.mqtt_set_inverter_online_state(state=False)
-
-                    if -1 < inverter_unresponsive_seconds <= self.assume_inverter_offline_after_seconds:
-                        inverter_unresponsive_seconds += self.poll_period
-                    else:
-                        await self.log_to_file({"power_1": 0, "power_2": 0})
-                        await self.publish_to_mqtt("data", {"power_1": 0, "power_2": 0})
-                        inverter_unresponsive_seconds = -1
+                if not self.mqtt_client.is_connected():
+                    logger.warning("Could not connect to MQTT server!")
                 else:
-                    # no exception: inverter online. publish online state of inverter
-                    await self.mqtt_set_inverter_online_state(state=True)
-                    inverter_unresponsive_seconds = 0
 
-                finally:
-                    self.mqtt_client.loop_stop()
-                    await asyncio.sleep(self.poll_period)
-                    self.mqtt_client.loop_start()
-                    await asyncio.sleep(5)
+                    # get data from the inverter
+                    payload_dict = await self.get_data_from_inverter()
+                    inverter_last_seen = datetime.now().timestamp()
+
+                    # Log data to cv file
+                    await self.log_to_file(payload_dict)
+
+                    # Publish the same data to MQTT as JSON
+                    await self.publish_to_mqtt("data", payload_dict)
+
+                    # calculate statistics from log file and publish data
+                    await self.calc_publish_statistics()
+
+                self.mqtt_client.loop_stop()
+
+            except Exception as e:
+                # exception: inverter is unresponsive
+                logger.info(f"{type(e).__name__}: {e}. Inverter not reachable.")
+                await self.mqtt_set_inverter_online_state(state=False)
+
+                inverter_unresponsive_seconds = datetime.now().timestamp() - inverter_last_seen
+                if self.assume_inverter_offline_after_seconds < inverter_unresponsive_seconds:
+                    payload_dict = {"date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                    "power_1": 0, "power_2": 0,
+                                    "daily_production_1": 0, "daily_production_2": 0}
+                    await self.log_to_file(payload_dict)
+                    await self.publish_to_mqtt("data", payload_dict)
+                    # check sun state
+                    seconds_until_daylight, sunrise = self.get_seconds_until_daylight(self.coordinates)
+                    if seconds_until_daylight != 0:
+                        logger.info(f"Inverter is off for today, sleeping until sunrise at {sunrise}.")
+                        await asyncio.sleep(seconds_until_daylight)
 
             else:
+                # no Timeout exception: inverter online. publish online state of inverter
+                await self.mqtt_set_inverter_online_state(state=True)
+
+            finally:
+                # stop MQTT client
                 self.mqtt_client.loop_stop()
-                await asyncio.sleep(seconds_until_daylight)
-                self.mqtt_client.loop_start()
-                await asyncio.sleep(5)
+                await asyncio.sleep(self.poll_period)
 
     async def mqtt_set_inverter_online_state(self, state=True):
         timestamp_ms = int(datetime.now().timestamp() * 1000)
