@@ -12,6 +12,11 @@ from suntime import Sun
 import paho.mqtt.client as mqtt
 from APsystemsEZ1 import APsystemsEZ1M
 
+DEFAULT_COLUMNS_LIST = (
+    "date", "timestamp_ms", "power_1", "power_2",
+    "daily_production_1", "daily_production_2"
+)
+
 MQTT_DEFAULT_CONFIG = {
     "host": "localhost",
     "ca_certs": None,
@@ -36,7 +41,7 @@ logging.basicConfig(level=logging.INFO)
 
 class EZ1Logger:
     def __init__(self, mqtt_config, inverter_config, log_file, poll_period, coordinates, mqtt_topic_base="solar/ez1",
-                 assume_inverter_offline_after_seconds=300, test_mode=False):
+                 assume_inverter_offline_after_seconds=300, test_mode=False, log_columns_list=()):
         self.test_mode = test_mode
 
         logger.info("Initializing EZ1Logger.")
@@ -44,10 +49,10 @@ class EZ1Logger:
         logger.info(f"Poll period time: {poll_period} s")
 
         # create log file if it does not exist
-        csv_header = "date;timestamp_ms;power_1;power_2;daily_production_1;daily_production_2"
+        self.log_columns_list = log_columns_list or DEFAULT_COLUMNS_LIST
         self.log_file = Path(log_file)
         if not self.log_file.exists():
-            self.data_log_init(csv_header)
+            self.data_log_init()
 
         self.poll_period = poll_period
 
@@ -101,13 +106,13 @@ class EZ1Logger:
         #mqtt_client.loop_start()
         return mqtt_client
 
-    def data_log_init(self, header):
+    def data_log_init(self):
         # create folder and file for logging
         self.log_file.parent.mkdir(exist_ok=True)
         if not self.log_file.exists():
             logger.info(f"Creating file {self.log_file}")
             with open(self.log_file, mode='w') as log_file:
-                log_file.write(f"{header}\n")
+                log_file.write(f"{';'.join(self.log_columns_list)}\n")
 
     @staticmethod
     def get_seconds_until_daylight(coordinates):
@@ -206,6 +211,9 @@ class EZ1Logger:
         # add timestamp if not present
         if "timestamp_ms" not in data_row:
             data_row["timestamp_ms"] = int(datetime.now().timestamp() * 1000)
+
+        # assume that data_row has identical keys to log_columns_list
+        data_row = {key: data_row[key] for key in self.log_columns_list}
 
         # Writing to a CSV file asynchronously with aiofiles
         async with aiofiles.open(self.log_file, mode="a") as log_file:
